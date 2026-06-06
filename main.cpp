@@ -29,6 +29,12 @@ constexpr float  two_pi           = 6.28318530717958647692f;
 constexpr float  detector_highpass_cutoff_hz = 70.0f;
 constexpr float  detector_lowpass_cutoff_hz  = 380.0f;
 constexpr float  energy_to_volume_curve = 1.8f;
+constexpr float  local_selection_switch_margin_min = 0.0f;
+constexpr float  local_selection_switch_margin_max = 0.35f;
+constexpr float  local_selection_neighbor_bias_min = 0.7f;
+constexpr float  local_selection_neighbor_bias_max = 1.4f;
+constexpr float  dual_note_window_similarity_min = 0.60f;
+constexpr float  dual_note_pair_balance_min = 0.72f;
 
 // -----------------------------------------------------------------------
 // Controls
@@ -39,9 +45,9 @@ struct Controls
     float radius         = 0.45f;  // 1  resonator radius
     float threshold      = 0.40f;  // 2  detection threshold
     float analysis_frame = 0.20f;  // 3  analysis window length: 128–2048 samples
-    float neighbor_range = 1.0f;  // 4  semitone neighborhood range for suppression
+    float local_selection_switch_margin = 0.30f;  // 4  takeover margin for neighbor winner
     float energy_slew    = 0.25f;  // 5  energy smoothing speed
-    float neighbor_threshold_boost = 0.25f;  // 6  threshold increase near active notes
+    float local_selection_neighbor_bias = 0.40f;  // 6  neighbor winner bias
     bool  full_bank_mode = false;  // toggle 1  full-bank output vs A-only output
     bool  fuzz_lp_dry_blend = false;  // toggle 3  fuzzed LP dry + HP synth blend
 };
@@ -61,42 +67,6 @@ float Lerp(float a, float b, float t) { return a + (b - a) * Clamp01(t); }
 float LogLerp(float lo, float hi, float t)
 {
     return lo * std::pow(hi / lo, Clamp01(t));
-}
-
-float HarmonicConfidence(int semitone_distance)
-{
-    const int distance = std::abs(semitone_distance);
-    if (distance == 0)
-        return 0.0f;
-
-    const int interval_class = distance % 12;
-    float confidence = 0.0f;
-
-    // High-confidence harmonic relationships.
-    if (interval_class == 0)
-        confidence = 1.00f;       // octave
-    else if (interval_class == 7)
-        confidence = 0.90f;       // fifth
-    else if (interval_class == 5)
-        confidence = 0.85f;       // fourth
-    else if (interval_class == 4 || interval_class == 9)
-        confidence = 0.45f;       // major third / major sixth
-
-    if (confidence <= 0.0f)
-        return 0.0f;
-
-    // Confidence decays slightly as intervals get farther apart.
-    const int octave_span = distance / 12;
-    return confidence / (1.0f + 0.25f * static_cast<float>(octave_span));
-}
-
-float HarmonicNeighborConfidence(int semitone_distance)
-{
-    // Neighboring bins around strong harmonic intervals can be false positives.
-    // Use a reduced confidence based on adjacent harmonic classes.
-    const float left_neighbor_confidence = HarmonicConfidence(semitone_distance - 1);
-    const float right_neighbor_confidence = HarmonicConfidence(semitone_distance + 1);
-    return 0.45f * std::max(left_neighbor_confidence, right_neighbor_confidence);
 }
 
 // -----------------------------------------------------------------------
@@ -134,10 +104,14 @@ void ProcessAudioBlock(
     const Controls c = controls;
 
     const float threshold = Lerp(0.0000001f, 0.99f, c.threshold);
-    const int neighbor_range_bins = static_cast<int>(std::round(Lerp(0.0f, 20.0f, c.neighbor_range)));
-    const float neighbor_threshold_boost = Lerp(0.0f, 50.0f, c.neighbor_threshold_boost);
-    const float harmonic_threshold_boost = neighbor_threshold_boost * 0.75f;
-    const float harmonic_neighbor_threshold_boost = harmonic_threshold_boost * 0.35f;
+    const float local_selection_switch_margin = Lerp(
+        local_selection_switch_margin_min,
+        local_selection_switch_margin_max,
+        c.local_selection_switch_margin);
+    const float local_selection_neighbor_bias = Lerp(
+        local_selection_neighbor_bias_min,
+        local_selection_neighbor_bias_max,
+        c.local_selection_neighbor_bias);
     constexpr float square_amplitude = 0.25f;
     const float radius = pitch_detector.GetRadius();
 
@@ -161,95 +135,98 @@ void ProcessAudioBlock(
             analysis_period_active = static_cast<int>(
                 LogLerp(128.0f, 2048.0f, c.analysis_frame));
 
-            std::array<bool, PolyPitchDetector::resonator_count> was_active{};
-            for (size_t index = 0; index < PolyPitchDetector::resonator_count; ++index)
-                was_active[index] = voice_amplitudes[index] > 0.0f;
+            std::array<float, PolyPitchDetector::resonator_count> selected_voice_amplitudes{};
 
-            // Only strong active bins are allowed to suppress neighbors/harmonics.
-            std::array<bool, PolyPitchDetector::resonator_count> is_strong_anchor{};
-            float max_active_energy = 0.0f;
-            for (size_t index = 0; index < PolyPitchDetector::resonator_count; ++index)
-            {
-                if (!was_active[index])
-                    continue;
-                max_active_energy = std::max(max_active_energy, pitch_detector.GetEnergyAtIndex(index));
-            }
-
-            if (max_active_energy > 0.0f)
-            {
-                const float anchor_energy_threshold = std::max(threshold, max_active_energy * 0.55f);
-                for (size_t index = 0; index < PolyPitchDetector::resonator_count; ++index)
-                {
-                    if (!was_active[index])
-                        continue;
-                    is_strong_anchor[index] =
-                        pitch_detector.GetEnergyAtIndex(index) >= anchor_energy_threshold;
-                }
-            }
+            const auto amplitude_from_energy = [&](float energy) {
+                const float normalized_amplitude = std::sqrt(std::max(energy, 0.0f))
+                                                 * (1.0f - radius);
+                const float linear_amplitude = std::clamp(normalized_amplitude * 12.0f, 0.0f, 1.0f);
+                const float shaped_amplitude = std::pow(linear_amplitude, energy_to_volume_curve);
+                return square_amplitude * shaped_amplitude;
+            };
 
             for (size_t resonator_index = 0;
                  resonator_index < PolyPitchDetector::resonator_count;
                  ++resonator_index)
             {
                 const float detected_energy = pitch_detector.GetEnergyAtIndex(resonator_index);
+                if (detected_energy < threshold)
+                    continue;
 
-                float adaptive_threshold = threshold;
-                if (neighbor_range_bins > 0)
+                const float left_energy = (resonator_index > 0)
+                                        ? pitch_detector.GetEnergyAtIndex(resonator_index - 1)
+                                        : -1.0f;
+                const float right_energy = (resonator_index + 1 < PolyPitchDetector::resonator_count)
+                                         ? pitch_detector.GetEnergyAtIndex(resonator_index + 1)
+                                         : -1.0f;
+
+                size_t winner_index = resonator_index;
+                float winner_score = detected_energy;
+
+                const float left_score = left_energy * local_selection_neighbor_bias;
+                if (left_score > winner_score * (1.0f + local_selection_switch_margin))
                 {
-                    for (size_t active_index = 0;
-                         active_index < PolyPitchDetector::resonator_count;
-                         ++active_index)
-                    {
-                        if (!is_strong_anchor[active_index])
-                            continue;
-
-                        const int semitone_distance = std::abs(
-                            static_cast<int>(resonator_index) - static_cast<int>(active_index));
-                        if (semitone_distance == 0 || semitone_distance > neighbor_range_bins)
-                            continue;
-
-                        const float proximity = 1.0f
-                                              - static_cast<float>(semitone_distance)
-                                                    / static_cast<float>(neighbor_range_bins + 1);
-                        adaptive_threshold += neighbor_threshold_boost * proximity;
-                    }
+                    winner_score = left_score;
+                    winner_index = resonator_index - 1;
                 }
 
-                for (size_t active_index = 0;
-                     active_index < PolyPitchDetector::resonator_count;
-                     ++active_index)
+                const float right_score = right_energy * local_selection_neighbor_bias;
+                if (right_score > winner_score * (1.0f + local_selection_switch_margin))
                 {
-                    if (!is_strong_anchor[active_index] || active_index == resonator_index)
-                        continue;
-
-                    const int semitone_distance = std::abs(
-                        static_cast<int>(resonator_index) - static_cast<int>(active_index));
-                    const float harmonic_confidence = HarmonicConfidence(semitone_distance);
-                    if (harmonic_confidence <= 0.0f)
-                    {
-                        const float harmonic_neighbor_confidence =
-                            HarmonicNeighborConfidence(semitone_distance);
-                        if (harmonic_neighbor_confidence <= 0.0f)
-                            continue;
-
-                        adaptive_threshold += harmonic_neighbor_threshold_boost
-                                            * harmonic_neighbor_confidence;
-                    }
-                    else
-                    {
-                        adaptive_threshold += harmonic_threshold_boost * harmonic_confidence;
-                    }
+                    winner_index = resonator_index + 1;
                 }
 
-                const float normalized_amplitude = std::sqrt(std::max(detected_energy, 0.0f))
-                                                 * (1.0f - radius);
-                const float linear_amplitude = std::clamp(normalized_amplitude * 12.0f, 0.0f, 1.0f);
-                const float shaped_amplitude = std::pow(linear_amplitude, energy_to_volume_curve);
-                const float amplitude_from_energy = square_amplitude * shaped_amplitude;
+                const float amplitude = amplitude_from_energy(detected_energy);
 
-                voice_amplitudes[resonator_index] =
-                    (detected_energy >= adaptive_threshold) ? amplitude_from_energy : 0.0f;
+                selected_voice_amplitudes[winner_index] = std::max(
+                    selected_voice_amplitudes[winner_index],
+                    amplitude);
+
+                // Preserve true neighboring-note double-stops: when a 5-bin
+                // window around an adjacent pair is similarly energized,
+                // keep both pair notes audible instead of collapsing to one.
+                if (resonator_index > 0
+                    && resonator_index + 3 < PolyPitchDetector::resonator_count)
+                {
+                    const size_t left_pair_index = resonator_index;
+                    const size_t right_pair_index = resonator_index + 1;
+
+                    const float window_e0 = pitch_detector.GetEnergyAtIndex(left_pair_index - 1);
+                    const float window_e1 = pitch_detector.GetEnergyAtIndex(left_pair_index);
+                    const float window_e2 = pitch_detector.GetEnergyAtIndex(right_pair_index);
+                    const float window_e3 = pitch_detector.GetEnergyAtIndex(right_pair_index + 1);
+                    const float window_e4 = pitch_detector.GetEnergyAtIndex(right_pair_index + 2);
+
+                    const float window_min = std::min(
+                        std::min(window_e0, window_e1),
+                        std::min(window_e2, std::min(window_e3, window_e4)));
+                    const float window_max = std::max(
+                        std::max(window_e0, window_e1),
+                        std::max(window_e2, std::max(window_e3, window_e4)));
+
+                    const float window_similarity = window_min / (window_max + 1.0e-9f);
+                    const float pair_balance = std::min(window_e1, window_e2)
+                                             / (std::max(window_e1, window_e2) + 1.0e-9f);
+
+                    const bool likely_dual_neighbor_notes =
+                        window_e1 >= threshold
+                        && window_e2 >= threshold
+                        && window_similarity >= dual_note_window_similarity_min
+                        && pair_balance >= dual_note_pair_balance_min;
+
+                    if (likely_dual_neighbor_notes)
+                    {
+                        selected_voice_amplitudes[left_pair_index] = std::max(
+                            selected_voice_amplitudes[left_pair_index],
+                            amplitude_from_energy(window_e1));
+                        selected_voice_amplitudes[right_pair_index] = std::max(
+                            selected_voice_amplitudes[right_pair_index],
+                            amplitude_from_energy(window_e2));
+                    }
+                }
             }
+
+            voice_amplitudes = selected_voice_amplitudes;
         }
 
         float wet = 0.0f;
@@ -340,9 +317,9 @@ int main()
         controls.radius          = terrarium.knobs[0].Process();
         controls.threshold       = terrarium.knobs[1].Process();
         controls.analysis_frame  = terrarium.knobs[2].Process();
-        // controls.neighbor_range  = terrarium.knobs[3].Process();
+        controls.local_selection_switch_margin = terrarium.knobs[3].Process();
         controls.energy_slew     = terrarium.knobs[4].Process();
-        controls.neighbor_threshold_boost = terrarium.knobs[5].Process();
+        controls.local_selection_neighbor_bias = terrarium.knobs[5].Process();
         controls.full_bank_mode  = terrarium.toggles[0].Pressed();
         controls.fuzz_lp_dry_blend = terrarium.toggles[2].Pressed();
 
