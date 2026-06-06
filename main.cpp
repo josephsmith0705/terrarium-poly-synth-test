@@ -28,6 +28,7 @@ Terrarium terrarium;
 constexpr float  two_pi           = 6.28318530717958647692f;
 constexpr float  detector_highpass_cutoff_hz = 70.0f;
 constexpr float  detector_lowpass_cutoff_hz  = 380.0f;
+constexpr float  energy_to_volume_curve = 1.8f;
 
 // -----------------------------------------------------------------------
 // Controls
@@ -38,7 +39,7 @@ struct Controls
     float radius         = 0.45f;  // 1  resonator radius
     float threshold      = 0.40f;  // 2  detection threshold
     float analysis_frame = 0.20f;  // 3  analysis window length: 128–2048 samples
-    float neighbor_range = 0.30f;  // 4  semitone neighborhood range for suppression
+    float neighbor_range = 1.0f;  // 4  semitone neighborhood range for suppression
     float energy_slew    = 0.25f;  // 5  energy smoothing speed
     float neighbor_threshold_boost = 0.25f;  // 6  threshold increase near active notes
     bool  full_bank_mode = false;  // toggle 1  full-bank output vs A-only output
@@ -108,7 +109,6 @@ int analysis_counter = 0;
 int analysis_period_active = 256;
 
 std::array<float, PolyPitchDetector::resonator_count> square_phases{};
-std::array<float, PolyPitchDetector::resonator_count> square_phase_steps{};
 std::array<float, PolyPitchDetector::resonator_count> voice_amplitudes{};
 
 float split_blend_alpha = 0.03f;
@@ -133,9 +133,9 @@ void ProcessAudioBlock(
 {
     const Controls c = controls;
 
-    const float threshold = Lerp(0.0001f, 0.99f, c.threshold);
+    const float threshold = Lerp(0.0000001f, 0.99f, c.threshold);
     const int neighbor_range_bins = static_cast<int>(std::round(Lerp(0.0f, 20.0f, c.neighbor_range)));
-    const float neighbor_threshold_boost = Lerp(0.0f, 1000.0f, c.neighbor_threshold_boost);
+    const float neighbor_threshold_boost = Lerp(0.0f, 50.0f, c.neighbor_threshold_boost);
     const float harmonic_threshold_boost = neighbor_threshold_boost * 0.75f;
     const float harmonic_neighbor_threshold_boost = harmonic_threshold_boost * 0.35f;
     constexpr float square_amplitude = 0.25f;
@@ -243,8 +243,9 @@ void ProcessAudioBlock(
 
                 const float normalized_amplitude = std::sqrt(std::max(detected_energy, 0.0f))
                                                  * (1.0f - radius);
-                const float amplitude_from_energy = square_amplitude
-                                                  * std::clamp(normalized_amplitude * 12.0f, 0.0f, 1.0f);
+                const float linear_amplitude = std::clamp(normalized_amplitude * 12.0f, 0.0f, 1.0f);
+                const float shaped_amplitude = std::pow(linear_amplitude, energy_to_volume_curve);
+                const float amplitude_from_energy = square_amplitude * shaped_amplitude;
 
                 voice_amplitudes[resonator_index] =
                     (detected_energy >= adaptive_threshold) ? amplitude_from_energy : 0.0f;
@@ -257,26 +258,24 @@ void ProcessAudioBlock(
              resonator_index < PolyPitchDetector::resonator_count;
              ++resonator_index)
         {
-            // In A-only output mode, keep full-bank detection active but only
-            // render the A-string voice so suppression behavior can be tested.
-            if (!c.full_bank_mode
-                && resonator_index != PolyPitchDetector::a_string_index)
-            {
-                continue;
-            }
-
             const float voice_amplitude = voice_amplitudes[resonator_index];
             if (voice_amplitude <= 0.0f)
                 continue;
 
-            square_phases[resonator_index] += square_phase_steps[resonator_index];
-            if (square_phases[resonator_index] >= 1.0f)
-                square_phases[resonator_index] -= 1.0f;
+            // In A-only output mode, keep full-bank detection active but only
+            // render the A-string voice so suppression behavior can be tested.
+            if (!c.full_bank_mode
+                && resonator_index != PolyPitchDetector::a_string_index)
+                continue;
 
-            const float voice_sample = (square_phases[resonator_index] < 0.5f)
-                                     ? voice_amplitude
-                                     : -voice_amplitude;
-            wet += voice_sample;
+            const float frequency = pitch_detector.GetFrequencyAtIndex(resonator_index);
+            const float phase_step = two_pi * frequency / sample_rate_hz;
+            square_phases[resonator_index] += phase_step;
+            if (square_phases[resonator_index] >= two_pi)
+                square_phases[resonator_index] -= two_pi;
+
+            const float square = (square_phases[resonator_index] < 3.14159265f) ? 1.0f : -1.0f;
+            wet += square * voice_amplitude;
             ++active_voice_count;
         }
 
@@ -329,8 +328,6 @@ int main()
          ++resonator_index)
     {
         square_phases[resonator_index] = 0.0f;
-        square_phase_steps[resonator_index] =
-            pitch_detector.GetFrequencyAtIndex(resonator_index) / sample_rate_hz;
         voice_amplitudes[resonator_index] = 0.0f;
     }
 
@@ -342,15 +339,15 @@ int main()
     terrarium.Loop(250, [&]() {
         controls.radius          = terrarium.knobs[0].Process();
         controls.threshold       = terrarium.knobs[1].Process();
-        controls.analysis_frame  = terrarium.knobs[2].Process() * 5;
-        controls.neighbor_range  = terrarium.knobs[3].Process();
+        controls.analysis_frame  = terrarium.knobs[2].Process();
+        // controls.neighbor_range  = terrarium.knobs[3].Process();
         controls.energy_slew     = terrarium.knobs[4].Process();
         controls.neighbor_threshold_boost = terrarium.knobs[5].Process();
         controls.full_bank_mode  = terrarium.toggles[0].Pressed();
         controls.fuzz_lp_dry_blend = terrarium.toggles[2].Pressed();
 
         // Radius close to 1.0 means narrower frequency selectivity.
-        pitch_detector.SetRadius(LogLerp(0.9900f, 0.99999f, controls.radius));
+        pitch_detector.SetRadius(LogLerp(0.9990f, 0.99999999f, controls.radius));
         // Higher energy slew is faster response but can be twitchier.
         pitch_detector.SetEnergySlew(Lerp(0.001f, 0.50f, controls.energy_slew));
         // Always keep detection in full-range mode. The toggle now only

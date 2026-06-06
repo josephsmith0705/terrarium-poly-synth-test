@@ -2,6 +2,25 @@ cmake_minimum_required(VERSION 3.50)
 project(TerrariumPolySynth VERSION 1.0.0)
 
 set(FIRMWARE_NAME TerrariumPolySynth)
+set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
+set(PIANO_SAMPLE_HEADER ${GENERATED_DIR}/PianoASample.h)
+
+add_custom_command(
+    OUTPUT ${PIANO_SAMPLE_HEADER}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${GENERATED_DIR}
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/util/embed_wav_header.py
+            --input ${CMAKE_SOURCE_DIR}/PianoA.wav
+            --output ${PIANO_SAMPLE_HEADER}
+            --symbol PianoA_wav
+            --target-rate 12000
+            --max-seconds 1.8
+    DEPENDS ${CMAKE_SOURCE_DIR}/PianoA.wav
+            ${CMAKE_SOURCE_DIR}/util/embed_wav_header.py
+    COMMENT "Embedding PianoA.wav as header"
+)
+
+add_custom_target(embed_piano_sample DEPENDS ${PIANO_SAMPLE_HEADER})
+
 set(FIRMWARE_SOURCES
     main.cpp
     syscalls.c
@@ -21,7 +40,9 @@ add_subdirectory(lib/q)
 add_subdirectory(lib/gcem)
 
 target_include_directories(${FIRMWARE_NAME} PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(${FIRMWARE_NAME} PRIVATE ${GENERATED_DIR})
 target_link_libraries(${FIRMWARE_NAME} PUBLIC libq gcem)
+add_dependencies(${FIRMWARE_NAME} embed_piano_sample)
 
 set_target_properties(${FIRMWARE_NAME} PROPERTIES
     CXX_STANDARD 20
