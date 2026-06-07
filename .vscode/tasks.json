@@ -40,7 +40,7 @@
     {
       "label": "Flash Firmware (DFU)",
       "type": "shell",
-      "command": "if [ \"${input:confirmDfu}\" != \"YES\" ]; then echo 'Flash cancelled.'; exit 1; fi; command -v dfu-util >/dev/null 2>&1 || { echo 'dfu-util not found. Install it first (brew install dfu-util).'; exit 1; }; [ -f build/TerrariumPolySynth.bin ] || { echo 'Missing build/TerrariumPolySynth.bin. Run Build Firmware first.'; exit 1; }; dfu-util -a 0 -s 0x08000000:leave -D build/TerrariumPolySynth.bin -d ,0483:df11",
+      "command": "command -v dfu-util >/dev/null 2>&1 || { echo 'dfu-util not found. Install it first (brew install dfu-util).'; exit 1; }; [ -f build/TerrariumPolySynth.bin ] || { echo 'Missing build/TerrariumPolySynth.bin. Run Build Firmware first.'; exit 1; }; echo 'Put Daisy Seed into DFU mode (hold BOOT, tap RESET). Waiting for device... (Ctrl+C to cancel)'; until dfu-util -l 2>/dev/null | grep -q '0483:df11'; do sleep 0.5; done; echo 'Device found. Flashing...'; dfu-util -a 0 -s 0x08000000:leave -D build/TerrariumPolySynth.bin -d ,0483:df11",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -57,12 +57,5 @@
       "problemMatcher": []
     }
   ],
-  "inputs": [
-    {
-      "id": "confirmDfu",
-      "type": "promptString",
-      "description": "Confirm Daisy Seed is in DFU mode. Type YES to continue flashing.",
-      "default": "NO"
-    }
-  ]
+  "inputs": []
 }

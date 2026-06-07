@@ -14,13 +14,12 @@ public:
     static constexpr float  low_e_hz         = 82.4069f;   // E2
     static constexpr float  high_e_plus_two_octaves_hz = 1318.510f;  // E6
     static constexpr int    low_e_midi       = 40;         // E2
-    static constexpr int    high_e_plus_two_octaves_midi = 88;  // E6
+    static constexpr int    high_e_plus_two_octaves_midi = 88;  // D#4 / bottom 24 notes
     static constexpr size_t resonator_count =
         static_cast<size_t>(high_e_plus_two_octaves_midi - low_e_midi + 1);
     static constexpr size_t a_string_index = static_cast<size_t>(45 - low_e_midi);  // A2
     static constexpr float  default_radius   = 0.9975f;
     static constexpr float  default_energy_slew = 0.012f;
-
     enum class Mode
     {
         SingleA,
@@ -48,7 +47,6 @@ public:
 
         SetRadius(default_radius);
         SetEnergySlew(default_energy_slew);
-        SetMode(Mode::SingleA);
     }
 
     void SetMode(Mode mode) { mode_ = mode; }
@@ -71,12 +69,6 @@ public:
 
     void Process(float input)
     {
-        if (mode_ == Mode::SingleA)
-        {
-            ProcessResonator(resonators[a_string_index], input);
-            return;
-        }
-
         for (auto& resonator : resonators)
             ProcessResonator(resonator, input);
     }
@@ -87,14 +79,13 @@ public:
         Analysis analysis{};
 
         const Resonator* best_resonator = &resonators[a_string_index];
-        if (mode_ == Mode::FullRange)
+
+        for (const auto& resonator : resonators)
         {
-            for (const auto& resonator : resonators)
-            {
-                if (resonator.energy > best_resonator->energy)
-                    best_resonator = &resonator;
-            }
+            if (resonator.energy > best_resonator->energy)
+                best_resonator = &resonator;
         }
+        
 
         if (best_resonator->energy >= threshold)
         {
@@ -176,5 +167,5 @@ private:
     float sample_rate_hz = 48000.0f;
     float current_radius = default_radius;
     float energy_slew_factor = default_energy_slew;
-    Mode  mode_ = Mode::SingleA;
+    Mode mode_ = Mode::SingleA;
 };
