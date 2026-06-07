@@ -20,6 +20,8 @@ public:
     static constexpr size_t a_string_index = static_cast<size_t>(45 - low_e_midi);  // A2
     static constexpr float  default_radius   = 0.9975f;
     static constexpr float  default_energy_slew = 0.012f;
+    static constexpr size_t inactive_process_divisor = 4;
+    static constexpr float  inactive_energy_threshold = 1.0e-4f;
     enum class Mode
     {
         SingleA,
@@ -35,6 +37,7 @@ public:
     void Init(float sample_rate)
     {
         sample_rate_hz = sample_rate;
+        process_phase = 0;
         for (size_t index = 0; index < resonator_count; ++index)
         {
             resonators[index].real_state = 0.0f;
@@ -60,6 +63,7 @@ public:
             resonator.rotation_cosine = current_radius * std::cos(resonator_angle);
             resonator.rotation_sine = current_radius * std::sin(resonator_angle);
         }
+
     }
 
     void SetEnergySlew(float energy_slew)
@@ -69,8 +73,24 @@ public:
 
     void Process(float input)
     {
-        for (auto& resonator : resonators)
-            ProcessResonator(resonator, input);
+        for (size_t index = 0; index < resonator_count; ++index)
+        {
+            auto& resonator = resonators[index];
+            const bool is_active = resonator.energy >= inactive_energy_threshold;
+            const bool scheduled_this_sample = ((index + process_phase) % inactive_process_divisor) == 0;
+
+            if (is_active || scheduled_this_sample)
+            {
+                ProcessResonator(resonator, input);
+            }
+            else
+            {
+                // Cheap decay while skipped keeps dormant bins settling to zero.
+                resonator.energy += energy_slew_factor * (0.0f - resonator.energy);
+            }
+        }
+
+        process_phase = (process_phase + 1) % inactive_process_divisor;
     }
 
     // Reports the A-string pitch once the resonator energy crosses the threshold.
@@ -167,5 +187,6 @@ private:
     float sample_rate_hz = 48000.0f;
     float current_radius = default_radius;
     float energy_slew_factor = default_energy_slew;
+    size_t process_phase = 0;
     Mode mode_ = Mode::SingleA;
 };
