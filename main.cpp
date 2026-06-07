@@ -27,11 +27,20 @@ constexpr float  input_lowpass_cutoff_hz  = 380.0f;
 constexpr float  energy_to_volume_curve = 1.8f;
 constexpr size_t detector_decimation_factor = 2;
 constexpr int    analysis_period_detector_samples = 128;
-constexpr float  synth_lowpass_cutoff_min_hz = 120.0f;
-constexpr float  synth_lowpass_cutoff_max_hz = 4800.0f;
+constexpr float  synth_lowpass_cutoff_min_hz = 350.0f;
+constexpr float  synth_lowpass_cutoff_max_hz = 10000.0f;
 constexpr float  square_amplitude = 0.85f;
 constexpr float  synth_output_gain = 2.0f;
 constexpr size_t max_synth_voices = 12;
+constexpr float  neighbor_competition_min = 0.0f;
+constexpr float  neighbor_competition_max = 1.0f;
+constexpr float  neighbor_activity_threshold = 1.0e-5f;
+constexpr float  neighbor_dominance_deadzone = 0.10f;
+constexpr float  neighbor_transfer_max_fraction = 0.30f;
+constexpr float  output_level_min = 0.8f;
+constexpr float  output_level_max = 6.0f;
+constexpr float  blend_min = 0.0f;
+constexpr float  blend_max = 1.0f;
 
 // -----------------------------------------------------------------------
 // Controls
@@ -41,6 +50,10 @@ struct Controls
 {
     float radius = 0.45f;  // knob 1  resonator radius
     float lpf_cutoff_hz = 600.0f;  // knob 2  synth output LPF frequency in Hz
+    float neighbor_competition = 0.5f;  // knob 3  adjacent resonator competition
+    float output_level = 2.0f;  // knob 5  master synth level
+    float synth_blend = 1.0f;  // knob 6  dry/wet blend (0=dry, 1=wet)
+    bool ignore_neighbor_competition = false;  // toggle 3 bypasses neighbor competition
 };
 
 volatile bool effect_enabled = true;
@@ -52,6 +65,12 @@ float Clamp01(float x) { return std::clamp(x, 0.0f, 1.0f); }
 float LogLerp(float lo, float hi, float t)
 {
     return lo * std::pow(hi / lo, Clamp01(t));
+}
+
+float Lerp(float lo, float hi, float t)
+{
+    const float clamped_t = Clamp01(t);
+    return lo + (hi - lo) * clamped_t;
 }
 
 PolyPitchDetector pitch_detector;
@@ -86,9 +105,15 @@ void FilterInput(float dry)
 void UpdateVoiceAmplitudesFromDetector(float radius)
 {
     std::array<float, PolyPitchDetector::resonator_count> selected_voice_amplitudes{};
+    std::array<float, PolyPitchDetector::resonator_count> energies{};
+    std::array<float, PolyPitchDetector::resonator_count> competition_delta{};
     std::array<float, max_synth_voices> top_voice_energies{};
     std::array<size_t, max_synth_voices> top_voice_indices{};
     top_voice_indices.fill(PolyPitchDetector::resonator_count);
+
+    const float neighbor_competition = controls.ignore_neighbor_competition
+                                     ? 0.0f
+                                     : controls.neighbor_competition;
 
     const auto amplitude_from_energy = [&](float energy) {
         const float normalized_amplitude = std::sqrt(std::max(energy, 0.0f))
@@ -102,7 +127,60 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
          resonator_index < PolyPitchDetector::resonator_count;
          ++resonator_index)
     {
-        const float detected_energy = pitch_detector.GetEnergyAtIndex(resonator_index);
+        energies[resonator_index] = pitch_detector.GetEnergyAtIndex(resonator_index);
+    }
+
+    if (neighbor_competition > 0.0f)
+    {
+        for (size_t resonator_index = 0;
+             resonator_index + 1 < PolyPitchDetector::resonator_count;
+             ++resonator_index)
+        {
+            const float left_energy = energies[resonator_index];
+            const float right_energy = energies[resonator_index + 1];
+            if (left_energy < neighbor_activity_threshold
+                || right_energy < neighbor_activity_threshold)
+            {
+                continue;
+            }
+
+            const float pair_energy = left_energy + right_energy;
+            if (pair_energy <= 1.0e-9f)
+                continue;
+
+            const float dominance = (left_energy - right_energy) / pair_energy;
+            const float abs_dominance = std::abs(dominance);
+            if (abs_dominance <= neighbor_dominance_deadzone)
+                continue;
+
+            const float dominance_strength =
+                (abs_dominance - neighbor_dominance_deadzone)
+                / (1.0f - neighbor_dominance_deadzone);
+
+            const float transfer_amount = neighbor_competition
+                                        * dominance_strength
+                                        * (std::min(left_energy, right_energy)
+                                           * neighbor_transfer_max_fraction);
+            if (left_energy > right_energy)
+            {
+                competition_delta[resonator_index] += transfer_amount;
+                competition_delta[resonator_index + 1] -= transfer_amount;
+            }
+            else if (right_energy > left_energy)
+            {
+                competition_delta[resonator_index] -= transfer_amount;
+                competition_delta[resonator_index + 1] += transfer_amount;
+            }
+        }
+    }
+
+    for (size_t resonator_index = 0;
+         resonator_index < PolyPitchDetector::resonator_count;
+         ++resonator_index)
+    {
+        const float detected_energy = std::max(
+            energies[resonator_index] + competition_delta[resonator_index],
+            0.0f);
         selected_voice_amplitudes[resonator_index] = amplitude_from_energy(detected_energy);
 
         for (size_t rank = 0; rank < max_synth_voices; ++rank)
@@ -156,7 +234,7 @@ float RenderOscillators()
         wet += square * (voice_amplitude * square_amplitude);
     }
 
-    return wet * synth_output_gain;
+    return wet * (synth_output_gain * controls.output_level);
 }
 
 void ProcessAudioBlock(
@@ -202,7 +280,9 @@ void ProcessAudioBlock(
         const float wet = RenderOscillators();
         synth_lowpass_state += synth_lowpass_alpha * (wet - synth_lowpass_state);
 
-        const float output = effect_enabled ? synth_lowpass_state : dry;
+        const float output = effect_enabled
+                   ? Lerp(dry, synth_lowpass_state, c.synth_blend)
+                   : dry;
         out[0][i] = std::clamp(output, -1.0f, 1.0f);
         out[1][i] = out[0][i];
     }
@@ -244,6 +324,19 @@ int main()
             synth_lowpass_cutoff_min_hz,
             synth_lowpass_cutoff_max_hz,
             terrarium.knobs[1].Process());
+        controls.neighbor_competition = Lerp(
+            neighbor_competition_min,
+            neighbor_competition_max,
+            terrarium.knobs[2].Process());
+        controls.output_level = LogLerp(
+            output_level_min,
+            output_level_max,
+            terrarium.knobs[4].Process());
+        controls.synth_blend = Lerp(
+            blend_min,
+            blend_max,
+            terrarium.knobs[5].Process());
+        controls.ignore_neighbor_competition = terrarium.toggles[2].Pressed();
 
         // Radius close to 1.0 means narrower frequency selectivity.
         pitch_detector.SetRadius(LogLerp(0.9990f, 0.99999999f, controls.radius));
@@ -253,6 +346,6 @@ int main()
             effect_enabled = !effect_enabled;
 
         led_effect.Set(effect_enabled ? 1.0f : 0.0f);
-        led_mode.Set(effect_enabled ? 0.15f : 0.0f);
+        led_mode.Set(controls.ignore_neighbor_competition ? 1.0f : 0.15f);
     });
 }
