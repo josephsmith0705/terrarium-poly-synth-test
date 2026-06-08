@@ -34,15 +34,21 @@ constexpr float  synth_lowpass_cutoff_max_hz = 10000.0f;
 constexpr float  square_amplitude = 0.85f;
 constexpr float  synth_output_gain = 2.0f;
 constexpr size_t max_synth_voices = 12;
-constexpr float  neighbor_competition_min = 0.0f;
+constexpr size_t harmonic_support_count = 3;
+constexpr size_t reverse_evidence_max_sources = 8;
 constexpr float  neighbor_competition_max = 5.0f;
 constexpr float  neighbor_activity_threshold = 1.0e-5f;
 constexpr float  neighbor_dominance_deadzone = 0.10f;
 constexpr float  neighbor_transfer_max_fraction = 0.30f;
 constexpr float  output_level_min = 0.8f;
 constexpr float  output_level_max = 6.0f;
-constexpr float  blend_min = 0.0f;
-constexpr float  blend_max = 1.0f;
+constexpr float  fixed_output_level_control = 0.5f;
+constexpr float  fixed_synth_blend = 1.0f;
+constexpr float  harmonic_gate_ratio_low = 0.20f;
+constexpr float  harmonic_gate_ratio_high = 1.10f;
+constexpr float  harmonic_support_boost_max = 1.2f;
+constexpr float  harmonic_reverse_penalty_max = 0.85f;
+constexpr float  harmonic_suppression_intensity_scale = 10.0f;
 constexpr float  input_gate_open_threshold = 0.012f;
 constexpr float  input_gate_close_threshold = 0.008f;
 constexpr float  input_gate_detector_attack_ms = 1.5f;
@@ -60,11 +66,12 @@ struct Controls
 {
     float radius = 0.45f;  // knob 1  resonator radius
     float lpf_cutoff_hz = 600.0f;  // knob 2  synth output LPF frequency in Hz
-    float neighbor_competition = 0.5f;  // knob 3  adjacent resonator competition
-    float output_level = 2.0f;  // knob 5  master synth level
-    float synth_blend = 1.0f;  // knob 6  dry/wet blend (0=dry, 1=wet)
+    float neighbor_competition = neighbor_competition_max;  // temporarily fixed to 100%
+    float output_level = 2.0f;  // temporarily fixed in control loop
+    float synth_blend = fixed_synth_blend;  // temporarily fixed to 100% wet
+    float harmonic_suppression = 0.5f;  // knob 3  harmonic support/suppression intensity
     bool use_input_gate = false;  // toggle 2 enables input gate for synth cutoff
-    bool ignore_neighbor_competition = false;  // toggle 3 bypasses neighbor competition
+    bool bypass_harmonic_suppression = false;  // toggle 3 bypasses harmonic support/suppression
 };
 
 volatile bool effect_enabled = true;
@@ -73,7 +80,7 @@ float         sample_rate_hz = 48000.0f;
 
 float Clamp01(float x) { return std::clamp(x, 0.0f, 1.0f); }
 
-float LogLerp(float lo, float hi, float t)
+float LogInterp(float lo, float hi, float t)
 {
     return lo * std::pow(hi / lo, Clamp01(t));
 }
@@ -95,6 +102,17 @@ std::array<float, PolyPitchDetector::resonator_count> resonator_frequencies{};
 std::array<size_t, max_synth_voices> active_voice_indices{};
 size_t active_voice_count = 0;
 
+struct ReverseEvidenceSource
+{
+    size_t fundamental_index = PolyPitchDetector::resonator_count;
+    float weight = 0.0f;
+};
+
+std::array<std::array<size_t, harmonic_support_count>, PolyPitchDetector::resonator_count>
+    harmonic_map{};
+std::array<std::array<ReverseEvidenceSource, reverse_evidence_max_sources>, PolyPitchDetector::resonator_count>
+    reverse_harmonic_map{};
+
 OnePoleLowpass synth_output_lowpass;
 
 float detector_highpass_alpha = 0.99f;
@@ -103,6 +121,134 @@ float detector_highpass_state = 0.0f;
 float detector_previous_input = 0.0f;
 OnePoleLowpass detector_input_lowpass;
 InputGate input_gate;
+
+constexpr std::array<float, harmonic_support_count> harmonic_multipliers{
+    2.0f,
+    3.0f,
+    4.0f,
+};
+
+constexpr std::array<float, harmonic_support_count> harmonic_weights{
+    1.0f,
+    0.7f,
+    0.45f,
+};
+
+float HzToMidi(float hz)
+{
+    return 69.0f + 12.0f * std::log2(hz / 440.0f);
+}
+
+size_t FrequencyToResonatorIndex(float hz)
+{
+    const int midi_note = static_cast<int>(std::round(HzToMidi(hz)));
+    const int clamped_midi = std::clamp(
+        midi_note,
+        PolyPitchDetector::low_e_midi,
+        PolyPitchDetector::high_e_plus_two_octaves_midi);
+    return static_cast<size_t>(clamped_midi - PolyPitchDetector::low_e_midi);
+}
+
+void InsertReverseEvidenceSource(
+    std::array<ReverseEvidenceSource, reverse_evidence_max_sources>& reverse_sources,
+    size_t fundamental_index,
+    float weight)
+{
+    for (auto& reverse_source : reverse_sources)
+    {
+        if (reverse_source.fundamental_index < PolyPitchDetector::resonator_count)
+            continue;
+
+        reverse_source.fundamental_index = fundamental_index;
+        reverse_source.weight = weight;
+        return;
+    }
+
+    size_t weakest_index = 0;
+    for (size_t source_index = 1; source_index < reverse_evidence_max_sources; ++source_index)
+    {
+        if (reverse_sources[source_index].weight < reverse_sources[weakest_index].weight)
+            weakest_index = source_index;
+    }
+
+    if (weight > reverse_sources[weakest_index].weight)
+    {
+        reverse_sources[weakest_index].fundamental_index = fundamental_index;
+        reverse_sources[weakest_index].weight = weight;
+    }
+}
+
+void InitializeHarmonicMaps()
+{
+    for (auto& reverse_sources : reverse_harmonic_map)
+    {
+        for (auto& reverse_source : reverse_sources)
+            reverse_source = {};
+    }
+
+    for (size_t index = 0; index < PolyPitchDetector::resonator_count; ++index)
+    {
+        for (size_t harmonic_index = 0; harmonic_index < harmonic_support_count; ++harmonic_index)
+        {
+            const float harmonic_frequency =
+                resonator_frequencies[index] * harmonic_multipliers[harmonic_index];
+            const size_t mapped_index = harmonic_frequency > resonator_frequencies.back()
+                                          ? PolyPitchDetector::resonator_count
+                                          : FrequencyToResonatorIndex(harmonic_frequency);
+            harmonic_map[index][harmonic_index] = mapped_index;
+
+            if (mapped_index >= PolyPitchDetector::resonator_count)
+                continue;
+
+            InsertReverseEvidenceSource(
+                reverse_harmonic_map[mapped_index],
+                index,
+                harmonic_weights[harmonic_index]);
+        }
+    }
+}
+
+float HarmonicSupportRatio(size_t index, const std::array<float, PolyPitchDetector::resonator_count>& energies)
+{
+    float weighted_harmonic_energy = 0.0f;
+    float total_harmonic_weight = 0.0f;
+    for (size_t harmonic_index = 0; harmonic_index < harmonic_support_count; ++harmonic_index)
+    {
+        const size_t mapped_index = harmonic_map[index][harmonic_index];
+        if (mapped_index >= PolyPitchDetector::resonator_count)
+            continue;
+
+        const float harmonic_weight = harmonic_weights[harmonic_index];
+        weighted_harmonic_energy += energies[mapped_index] * harmonic_weight;
+        total_harmonic_weight += harmonic_weight;
+    }
+
+    if (total_harmonic_weight <= 1.0e-9f)
+        return 0.0f;
+
+    const float normalized_support = weighted_harmonic_energy / total_harmonic_weight;
+    return normalized_support / (energies[index] + 1.0e-9f);
+}
+
+float HarmonicReverseRatio(size_t index, const std::array<float, PolyPitchDetector::resonator_count>& energies)
+{
+    float weighted_fundamental_energy = 0.0f;
+    float total_weight = 0.0f;
+    for (const auto& reverse_source : reverse_harmonic_map[index])
+    {
+        if (reverse_source.fundamental_index >= PolyPitchDetector::resonator_count)
+            continue;
+
+        weighted_fundamental_energy += energies[reverse_source.fundamental_index] * reverse_source.weight;
+        total_weight += reverse_source.weight;
+    }
+
+    if (total_weight <= 1.0e-9f)
+        return 0.0f;
+
+    const float normalized_reverse_energy = weighted_fundamental_energy / total_weight;
+    return normalized_reverse_energy / (energies[index] + 1.0e-9f);
+}
 
 void FilterInput(float dry)
 {
@@ -147,9 +293,7 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
     initial_top_indices.fill(PolyPitchDetector::resonator_count);
     final_top_indices.fill(PolyPitchDetector::resonator_count);
 
-    const float neighbor_competition = controls.ignore_neighbor_competition
-                                     ? 0.0f
-                                     : controls.neighbor_competition;
+    const float neighbor_competition = controls.neighbor_competition;
 
     const auto amplitude_from_energy = [&](float energy) {
         const float normalized_amplitude = std::sqrt(std::max(energy, 0.0f))
@@ -178,6 +322,40 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
         if (resonator_index >= PolyPitchDetector::resonator_count)
             continue;
         initially_selected[resonator_index] = true;
+    }
+
+    if (!controls.bypass_harmonic_suppression)
+    {
+        for (size_t resonator_index = 0;
+             resonator_index < PolyPitchDetector::resonator_count;
+             ++resonator_index)
+        {
+            if (!initially_selected[resonator_index])
+                continue;
+
+            const float support_ratio = HarmonicSupportRatio(resonator_index, energies);
+            const float reverse_ratio = HarmonicReverseRatio(resonator_index, energies);
+            const float support_weight = std::clamp(
+                (support_ratio - harmonic_gate_ratio_low)
+                    / (harmonic_gate_ratio_high - harmonic_gate_ratio_low),
+                0.0f,
+                1.0f);
+            const float reverse_weight = std::clamp(
+                (reverse_ratio - harmonic_gate_ratio_low)
+                    / (harmonic_gate_ratio_high - harmonic_gate_ratio_low),
+                0.0f,
+                1.0f);
+            const float suppression_amount =
+                controls.harmonic_suppression * harmonic_suppression_intensity_scale;
+
+            const float support_gain =
+                1.0f + suppression_amount * harmonic_support_boost_max * support_weight;
+            const float reverse_penalty = std::max(
+                1.0f - suppression_amount * harmonic_reverse_penalty_max * reverse_weight,
+                0.1f);
+            competed_energies[resonator_index] =
+                std::max(energies[resonator_index] * support_gain * reverse_penalty, 0.0f);
+        }
     }
 
     if (neighbor_competition > 0.0f)
@@ -361,6 +539,7 @@ int main()
         resonator_frequencies[resonator_index] =
             pitch_detector.GetFrequencyAtIndex(resonator_index);
     }
+    InitializeHarmonicMaps();
 
     auto& led_effect = terrarium.leds[0];
     auto& led_mode   = terrarium.leds[1];
@@ -369,32 +548,27 @@ int main()
 
     terrarium.Loop(250, [&]() {
         controls.radius = terrarium.knobs[0].Process();
-        controls.lpf_cutoff_hz = LogLerp(
+        controls.lpf_cutoff_hz = LogInterp(
             synth_lowpass_cutoff_min_hz,
             synth_lowpass_cutoff_max_hz,
             terrarium.knobs[1].Process());
-        controls.neighbor_competition = Lerp(
-            neighbor_competition_min,
-            neighbor_competition_max,
-            terrarium.knobs[2].Process());
-        controls.output_level = LogLerp(
+        controls.harmonic_suppression = terrarium.knobs[2].Process();
+        controls.neighbor_competition = neighbor_competition_max;
+        controls.output_level = LogInterp(
             output_level_min,
             output_level_max,
-            terrarium.knobs[4].Process());
-        controls.synth_blend = Lerp(
-            blend_min,
-            blend_max,
-            terrarium.knobs[5].Process());
+            fixed_output_level_control);
+        controls.synth_blend = fixed_synth_blend;
         controls.use_input_gate = terrarium.toggles[1].Pressed();
-        controls.ignore_neighbor_competition = terrarium.toggles[2].Pressed();
+        controls.bypass_harmonic_suppression = terrarium.toggles[2].Pressed();
 
         // Radius close to 1.0 means narrower frequency selectivity.
-        pitch_detector.SetRadius(LogLerp(0.9990f, 0.99999999f, controls.radius));
+        pitch_detector.SetRadius(LogInterp(0.9990f, 0.99999999f, controls.radius));
 
         if (terrarium.stomps[0].RisingEdge())
             effect_enabled = !effect_enabled;
 
         led_effect.Set(effect_enabled ? 1.0f : 0.0f);
-        led_mode.Set(controls.ignore_neighbor_competition ? 1.0f : 0.15f);
+        led_mode.Set(controls.bypass_harmonic_suppression ? 1.0f : 0.15f);
     });
 }
