@@ -33,7 +33,7 @@ constexpr float  square_amplitude = 0.85f;
 constexpr float  synth_output_gain = 2.0f;
 constexpr size_t max_synth_voices = 12;
 constexpr float  neighbor_competition_min = 0.0f;
-constexpr float  neighbor_competition_max = 1.0f;
+constexpr float  neighbor_competition_max = 5.0f;
 constexpr float  neighbor_activity_threshold = 1.0e-5f;
 constexpr float  neighbor_dominance_deadzone = 0.10f;
 constexpr float  neighbor_transfer_max_fraction = 0.30f;
@@ -41,6 +41,11 @@ constexpr float  output_level_min = 0.8f;
 constexpr float  output_level_max = 6.0f;
 constexpr float  blend_min = 0.0f;
 constexpr float  blend_max = 1.0f;
+constexpr float  input_gate_open_threshold = 0.012f;
+constexpr float  input_gate_close_threshold = 0.008f;
+constexpr float  input_gate_detector_attack_ms = 1.5f;
+constexpr float  input_gate_detector_release_ms = 35.0f;
+constexpr float  input_gate_hold_ms = 35.0f;
 
 // -----------------------------------------------------------------------
 // Controls
@@ -53,6 +58,7 @@ struct Controls
     float neighbor_competition = 0.5f;  // knob 3  adjacent resonator competition
     float output_level = 2.0f;  // knob 5  master synth level
     float synth_blend = 1.0f;  // knob 6  dry/wet blend (0=dry, 1=wet)
+    bool use_input_gate = false;  // toggle 2 enables input gate for synth cutoff
     bool ignore_neighbor_competition = false;  // toggle 3 bypasses neighbor competition
 };
 
@@ -92,6 +98,9 @@ float detector_lowpass_alpha  = 0.05f;
 float detector_highpass_state = 0.0f;
 float detector_previous_input = 0.0f;
 float detector_lowpass_state  = 0.0f;
+bool input_gate_open = true;
+float gate_detector_level = 0.0f;
+int   gate_hold_counter_samples = 0;
 
 void FilterInput(float dry)
 {
@@ -104,12 +113,15 @@ void FilterInput(float dry)
 
 void UpdateVoiceAmplitudesFromDetector(float radius)
 {
-    std::array<float, PolyPitchDetector::resonator_count> selected_voice_amplitudes{};
     std::array<float, PolyPitchDetector::resonator_count> energies{};
-    std::array<float, PolyPitchDetector::resonator_count> competition_delta{};
-    std::array<float, max_synth_voices> top_voice_energies{};
-    std::array<size_t, max_synth_voices> top_voice_indices{};
-    top_voice_indices.fill(PolyPitchDetector::resonator_count);
+    std::array<float, PolyPitchDetector::resonator_count> competed_energies{};
+    std::array<bool, PolyPitchDetector::resonator_count> initially_selected{};
+    std::array<float, max_synth_voices> initial_top_energies{};
+    std::array<size_t, max_synth_voices> initial_top_indices{};
+    std::array<float, max_synth_voices> final_top_energies{};
+    std::array<size_t, max_synth_voices> final_top_indices{};
+    initial_top_indices.fill(PolyPitchDetector::resonator_count);
+    final_top_indices.fill(PolyPitchDetector::resonator_count);
 
     const float neighbor_competition = controls.ignore_neighbor_competition
                                      ? 0.0f
@@ -128,6 +140,31 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
          ++resonator_index)
     {
         energies[resonator_index] = pitch_detector.GetEnergyAtIndex(resonator_index);
+        competed_energies[resonator_index] = energies[resonator_index];
+
+        for (size_t rank = 0; rank < max_synth_voices; ++rank)
+        {
+            if (energies[resonator_index] <= initial_top_energies[rank])
+                continue;
+
+            for (size_t shift = max_synth_voices - 1; shift > rank; --shift)
+            {
+                initial_top_energies[shift] = initial_top_energies[shift - 1];
+                initial_top_indices[shift] = initial_top_indices[shift - 1];
+            }
+
+            initial_top_energies[rank] = energies[resonator_index];
+            initial_top_indices[rank] = resonator_index;
+            break;
+        }
+    }
+
+    for (size_t rank = 0; rank < max_synth_voices; ++rank)
+    {
+        const size_t resonator_index = initial_top_indices[rank];
+        if (resonator_index >= PolyPitchDetector::resonator_count)
+            continue;
+        initially_selected[resonator_index] = true;
     }
 
     if (neighbor_competition > 0.0f)
@@ -136,8 +173,14 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
              resonator_index + 1 < PolyPitchDetector::resonator_count;
              ++resonator_index)
         {
-            const float left_energy = energies[resonator_index];
-            const float right_energy = energies[resonator_index + 1];
+            if (!(initially_selected[resonator_index]
+                  && initially_selected[resonator_index + 1]))
+            {
+                continue;
+            }
+
+            const float left_energy = competed_energies[resonator_index];
+            const float right_energy = competed_energies[resonator_index + 1];
             if (left_energy < neighbor_activity_threshold
                 || right_energy < neighbor_activity_threshold)
             {
@@ -163,14 +206,17 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
                                            * neighbor_transfer_max_fraction);
             if (left_energy > right_energy)
             {
-                competition_delta[resonator_index] += transfer_amount;
-                competition_delta[resonator_index + 1] -= transfer_amount;
+                competed_energies[resonator_index] += transfer_amount;
+                competed_energies[resonator_index + 1] -= transfer_amount;
             }
             else if (right_energy > left_energy)
             {
-                competition_delta[resonator_index] -= transfer_amount;
-                competition_delta[resonator_index + 1] += transfer_amount;
+                competed_energies[resonator_index] -= transfer_amount;
+                competed_energies[resonator_index + 1] += transfer_amount;
             }
+
+            competed_energies[resonator_index] = std::max(competed_energies[resonator_index], 0.0f);
+            competed_energies[resonator_index + 1] = std::max(competed_energies[resonator_index + 1], 0.0f);
         }
     }
 
@@ -178,24 +224,19 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
          resonator_index < PolyPitchDetector::resonator_count;
          ++resonator_index)
     {
-        const float detected_energy = std::max(
-            energies[resonator_index] + competition_delta[resonator_index],
-            0.0f);
-        selected_voice_amplitudes[resonator_index] = amplitude_from_energy(detected_energy);
-
         for (size_t rank = 0; rank < max_synth_voices; ++rank)
         {
-            if (detected_energy <= top_voice_energies[rank])
+            if (competed_energies[resonator_index] <= final_top_energies[rank])
                 continue;
 
             for (size_t shift = max_synth_voices - 1; shift > rank; --shift)
             {
-                top_voice_energies[shift] = top_voice_energies[shift - 1];
-                top_voice_indices[shift] = top_voice_indices[shift - 1];
+                final_top_energies[shift] = final_top_energies[shift - 1];
+                final_top_indices[shift] = final_top_indices[shift - 1];
             }
 
-            top_voice_energies[rank] = detected_energy;
-            top_voice_indices[rank] = resonator_index;
+            final_top_energies[rank] = competed_energies[resonator_index];
+            final_top_indices[rank] = resonator_index;
             break;
         }
     }
@@ -204,11 +245,11 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
     active_voice_count = 0;
     for (size_t rank = 0; rank < max_synth_voices; ++rank)
     {
-        const size_t resonator_index = top_voice_indices[rank];
+        const size_t resonator_index = final_top_indices[rank];
         if (resonator_index >= PolyPitchDetector::resonator_count)
             continue;
 
-        const float amplitude = selected_voice_amplitudes[resonator_index];
+        const float amplitude = amplitude_from_energy(competed_energies[resonator_index]);
         if (amplitude <= 0.0f)
             continue;
 
@@ -257,10 +298,50 @@ void ProcessAudioBlock(
     const float radius = pitch_detector.GetRadius();
     const float synth_lowpass_alpha = 1.0f
                                     - std::exp(-two_pi * c.lpf_cutoff_hz / sample_rate_hz);
+    const float gate_detector_attack_alpha = 1.0f
+                                           - std::exp(-1.0f / std::max((input_gate_detector_attack_ms * 0.001f) * sample_rate_hz, 1.0f));
+    const float gate_detector_release_alpha = 1.0f
+                                            - std::exp(-1.0f / std::max((input_gate_detector_release_ms * 0.001f) * sample_rate_hz, 1.0f));
+    const int gate_hold_samples = std::max(
+        1,
+        static_cast<int>(input_gate_hold_ms * 0.001f * sample_rate_hz));
 
     for (size_t i = 0; i < size; ++i)
     {
         const float dry = in[0][i];
+        const float dry_abs = std::abs(dry);
+        const float gate_alpha = dry_abs > gate_detector_level
+                               ? gate_detector_attack_alpha
+                               : gate_detector_release_alpha;
+        gate_detector_level += gate_alpha * (dry_abs - gate_detector_level);
+
+        if (c.use_input_gate)
+        {
+            if (input_gate_open)
+            {
+                if (gate_detector_level >= input_gate_open_threshold)
+                {
+                    gate_hold_counter_samples = gate_hold_samples;
+                }
+                else if (gate_detector_level < input_gate_close_threshold)
+                {
+                    if (gate_hold_counter_samples > 0)
+                        --gate_hold_counter_samples;
+                    if (gate_hold_counter_samples <= 0)
+                        input_gate_open = false;
+                }
+            }
+            else if (gate_detector_level > input_gate_open_threshold)
+            {
+                input_gate_open = true;
+                gate_hold_counter_samples = gate_hold_samples;
+            }
+        }
+        else
+        {
+            input_gate_open = true;
+            gate_hold_counter_samples = gate_hold_samples;
+        }
 
         FilterInput(dry);
 
@@ -277,7 +358,11 @@ void ProcessAudioBlock(
             }
         }
 
-        const float wet = RenderOscillators();
+        float wet = RenderOscillators();
+        if (c.use_input_gate && !input_gate_open)
+        {
+            wet = 0.0f;
+        }
         synth_lowpass_state += synth_lowpass_alpha * (wet - synth_lowpass_state);
 
         const float output = effect_enabled
@@ -336,6 +421,7 @@ int main()
             blend_min,
             blend_max,
             terrarium.knobs[5].Process());
+        controls.use_input_gate = terrarium.toggles[1].Pressed();
         controls.ignore_neighbor_competition = terrarium.toggles[2].Pressed();
 
         // Radius close to 1.0 means narrower frequency selectivity.
