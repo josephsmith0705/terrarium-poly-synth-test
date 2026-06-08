@@ -22,11 +22,6 @@ public:
     static constexpr float  default_energy_slew = 0.012f;
     static constexpr size_t inactive_process_divisor = 4;
     static constexpr float  inactive_energy_threshold = 1.0e-4f;
-    enum class Mode
-    {
-        SingleA,
-        FullRange,
-    };
 
     struct Analysis
     {
@@ -52,8 +47,6 @@ public:
         SetEnergySlew(default_energy_slew);
     }
 
-    void SetMode(Mode mode) { mode_ = mode; }
-
     void SetRadius(float radius)
     {
         current_radius = radius;
@@ -63,7 +56,6 @@ public:
             resonator.rotation_cosine = current_radius * std::cos(resonator_angle);
             resonator.rotation_sine = current_radius * std::sin(resonator_angle);
         }
-
     }
 
     void SetEnergySlew(float energy_slew)
@@ -93,7 +85,6 @@ public:
         process_phase = (process_phase + 1) % inactive_process_divisor;
     }
 
-    // Reports the A-string pitch once the resonator energy crosses the threshold.
     Analysis Analyze(float threshold) const
     {
         Analysis analysis{};
@@ -188,5 +179,4 @@ private:
     float current_radius = default_radius;
     float energy_slew_factor = default_energy_slew;
     size_t process_phase = 0;
-    Mode mode_ = Mode::SingleA;
 };

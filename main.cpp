@@ -14,6 +14,8 @@
 
 #include <daisy_seed.h>
 
+#include <util/InputGate.h>
+#include <util/OnePoleLowpass.h>
 #include <util/PolyPitchDetector.h>
 #include <util/Terrarium.h>
 
@@ -46,10 +48,13 @@ constexpr float  input_gate_close_threshold = 0.008f;
 constexpr float  input_gate_detector_attack_ms = 1.5f;
 constexpr float  input_gate_detector_release_ms = 35.0f;
 constexpr float  input_gate_hold_ms = 35.0f;
-
-// -----------------------------------------------------------------------
-// Controls
-// -----------------------------------------------------------------------
+constexpr InputGateConfig input_gate_config{
+    input_gate_open_threshold,
+    input_gate_close_threshold,
+    input_gate_detector_attack_ms,
+    input_gate_detector_release_ms,
+    input_gate_hold_ms,
+};
 
 struct Controls
 {
@@ -82,7 +87,6 @@ float Lerp(float lo, float hi, float t)
 PolyPitchDetector pitch_detector;
 
 int analysis_counter = 0;
-int analysis_period_active = analysis_period_detector_samples;
 size_t detector_decimation_phase = 0;
 
 std::array<float, PolyPitchDetector::resonator_count> square_phases{};
@@ -91,24 +95,44 @@ std::array<float, PolyPitchDetector::resonator_count> resonator_frequencies{};
 std::array<size_t, max_synth_voices> active_voice_indices{};
 size_t active_voice_count = 0;
 
-float synth_lowpass_state = 0.0f;
+OnePoleLowpass synth_output_lowpass;
 
 float detector_highpass_alpha = 0.99f;
 float detector_lowpass_alpha  = 0.05f;
 float detector_highpass_state = 0.0f;
 float detector_previous_input = 0.0f;
-float detector_lowpass_state  = 0.0f;
-bool input_gate_open = true;
-float gate_detector_level = 0.0f;
-int   gate_hold_counter_samples = 0;
+OnePoleLowpass detector_input_lowpass;
+InputGate input_gate;
 
 void FilterInput(float dry)
 {
     detector_highpass_state = detector_highpass_alpha
                             * (detector_highpass_state + dry - detector_previous_input);
     detector_previous_input = dry;
-    detector_lowpass_state += detector_lowpass_alpha
-                            * (detector_highpass_state - detector_lowpass_state);
+    detector_input_lowpass.Process(detector_highpass_state, detector_lowpass_alpha);
+}
+
+void RankResonatorEnergy(
+    float energy,
+    size_t resonator_index,
+    std::array<float, max_synth_voices>& top_energies,
+    std::array<size_t, max_synth_voices>& top_indices)
+{
+    for (size_t rank = 0; rank < max_synth_voices; ++rank)
+    {
+        if (energy <= top_energies[rank])
+            continue;
+
+        for (size_t shift = max_synth_voices - 1; shift > rank; --shift)
+        {
+            top_energies[shift] = top_energies[shift - 1];
+            top_indices[shift] = top_indices[shift - 1];
+        }
+
+        top_energies[rank] = energy;
+        top_indices[rank] = resonator_index;
+        return;
+    }
 }
 
 void UpdateVoiceAmplitudesFromDetector(float radius)
@@ -141,22 +165,11 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
     {
         energies[resonator_index] = pitch_detector.GetEnergyAtIndex(resonator_index);
         competed_energies[resonator_index] = energies[resonator_index];
-
-        for (size_t rank = 0; rank < max_synth_voices; ++rank)
-        {
-            if (energies[resonator_index] <= initial_top_energies[rank])
-                continue;
-
-            for (size_t shift = max_synth_voices - 1; shift > rank; --shift)
-            {
-                initial_top_energies[shift] = initial_top_energies[shift - 1];
-                initial_top_indices[shift] = initial_top_indices[shift - 1];
-            }
-
-            initial_top_energies[rank] = energies[resonator_index];
-            initial_top_indices[rank] = resonator_index;
-            break;
-        }
+        RankResonatorEnergy(
+            energies[resonator_index],
+            resonator_index,
+            initial_top_energies,
+            initial_top_indices);
     }
 
     for (size_t rank = 0; rank < max_synth_voices; ++rank)
@@ -224,21 +237,11 @@ void UpdateVoiceAmplitudesFromDetector(float radius)
          resonator_index < PolyPitchDetector::resonator_count;
          ++resonator_index)
     {
-        for (size_t rank = 0; rank < max_synth_voices; ++rank)
-        {
-            if (competed_energies[resonator_index] <= final_top_energies[rank])
-                continue;
-
-            for (size_t shift = max_synth_voices - 1; shift > rank; --shift)
-            {
-                final_top_energies[shift] = final_top_energies[shift - 1];
-                final_top_indices[shift] = final_top_indices[shift - 1];
-            }
-
-            final_top_energies[rank] = competed_energies[resonator_index];
-            final_top_indices[rank] = resonator_index;
-            break;
-        }
+        RankResonatorEnergy(
+            competed_energies[resonator_index],
+            resonator_index,
+            final_top_energies,
+            final_top_indices);
     }
 
     voice_amplitudes.fill(0.0f);
@@ -285,62 +288,20 @@ void ProcessAudioBlock(
 {
     const Controls c = controls;
 
-    if(!effect_enabled)
-    {
-        for (size_t i = 0; i < size; ++i)
-        {
-            out[0][i] = in[0][i];
-            out[1][i] = in[1][i];
-        }
-        return;
-    }
-
     const float radius = pitch_detector.GetRadius();
-    const float synth_lowpass_alpha = 1.0f
-                                    - std::exp(-two_pi * c.lpf_cutoff_hz / sample_rate_hz);
-    const float gate_detector_attack_alpha = 1.0f
-                                           - std::exp(-1.0f / std::max((input_gate_detector_attack_ms * 0.001f) * sample_rate_hz, 1.0f));
-    const float gate_detector_release_alpha = 1.0f
-                                            - std::exp(-1.0f / std::max((input_gate_detector_release_ms * 0.001f) * sample_rate_hz, 1.0f));
-    const int gate_hold_samples = std::max(
-        1,
-        static_cast<int>(input_gate_hold_ms * 0.001f * sample_rate_hz));
+    const float synth_lowpass_alpha =
+        OnePoleLowpass::AlphaFromCutoff(c.lpf_cutoff_hz, sample_rate_hz);
 
     for (size_t i = 0; i < size; ++i)
     {
         const float dry = in[0][i];
-        const float dry_abs = std::abs(dry);
-        const float gate_alpha = dry_abs > gate_detector_level
-                               ? gate_detector_attack_alpha
-                               : gate_detector_release_alpha;
-        gate_detector_level += gate_alpha * (dry_abs - gate_detector_level);
-
         if (c.use_input_gate)
         {
-            if (input_gate_open)
-            {
-                if (gate_detector_level >= input_gate_open_threshold)
-                {
-                    gate_hold_counter_samples = gate_hold_samples;
-                }
-                else if (gate_detector_level < input_gate_close_threshold)
-                {
-                    if (gate_hold_counter_samples > 0)
-                        --gate_hold_counter_samples;
-                    if (gate_hold_counter_samples <= 0)
-                        input_gate_open = false;
-                }
-            }
-            else if (gate_detector_level > input_gate_open_threshold)
-            {
-                input_gate_open = true;
-                gate_hold_counter_samples = gate_hold_samples;
-            }
+            input_gate.Process(std::abs(dry), sample_rate_hz, input_gate_config);
         }
         else
         {
-            input_gate_open = true;
-            gate_hold_counter_samples = gate_hold_samples;
+            input_gate.Reset(true);
         }
 
         FilterInput(dry);
@@ -348,10 +309,10 @@ void ProcessAudioBlock(
         detector_decimation_phase = (detector_decimation_phase + 1) % detector_decimation_factor;
         if (detector_decimation_phase == 0)
         {
-            pitch_detector.Process(detector_lowpass_state);
+            pitch_detector.Process(detector_input_lowpass.state());
 
             ++analysis_counter;
-            if (analysis_counter >= analysis_period_active)
+            if (analysis_counter >= analysis_period_detector_samples)
             {
                 analysis_counter = 0;
                 UpdateVoiceAmplitudesFromDetector(radius);
@@ -359,14 +320,14 @@ void ProcessAudioBlock(
         }
 
         float wet = RenderOscillators();
-        if (c.use_input_gate && !input_gate_open)
+        if (c.use_input_gate && !input_gate.is_open())
         {
             wet = 0.0f;
         }
-        synth_lowpass_state += synth_lowpass_alpha * (wet - synth_lowpass_state);
+        const float synth_lowpass_sample = synth_output_lowpass.Process(wet, synth_lowpass_alpha);
 
         const float output = effect_enabled
-                   ? Lerp(dry, synth_lowpass_state, c.synth_blend)
+                   ? Lerp(dry, synth_lowpass_sample, c.synth_blend)
                    : dry;
         out[0][i] = std::clamp(output, -1.0f, 1.0f);
         out[1][i] = out[0][i];
@@ -386,6 +347,9 @@ int main()
     const float highpass_rc = 1.0f / (two_pi * input_highpass_cutoff_hz);
     detector_highpass_alpha = highpass_rc / (highpass_rc + dt);
     detector_lowpass_alpha = 1.0f - std::exp(-two_pi * input_lowpass_cutoff_hz / sample_rate_hz);
+    detector_input_lowpass.Reset(0.0f);
+    synth_output_lowpass.Reset(0.0f);
+    input_gate.Reset(true);
     pitch_detector.SetEnergySlew(0.25f);
 
     for (size_t resonator_index = 0;
@@ -426,7 +390,6 @@ int main()
 
         // Radius close to 1.0 means narrower frequency selectivity.
         pitch_detector.SetRadius(LogLerp(0.9990f, 0.99999999f, controls.radius));
-        pitch_detector.SetMode(PolyPitchDetector::Mode::FullRange);
 
         if (terrarium.stomps[0].RisingEdge())
             effect_enabled = !effect_enabled;
